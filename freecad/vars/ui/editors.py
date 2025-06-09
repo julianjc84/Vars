@@ -33,6 +33,7 @@ from .style import FlatIcon, interpolate_style_vars, TEXT_COLOR
 from textwrap import shorten, dedent
 import contextlib
 from . import widgets as uix
+from freecad.vars.vendor.fcapi.fpo import PropertyMode # Import PropertyMode
 
 import FreeCAD as App  # type: ignore
 
@@ -40,8 +41,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
     from FreeCAD import Document, DocumentObject  # type: ignore
-    from PySide6.QtWidgets import QGraphicsOpacityEffect, QCompleter
-    from PySide6.QtCore import QSettings, QObject, QEvent
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QCompleter # type: ignore
+    from PySide6.QtCore import QSettings, QObject, QEvent # type: ignore
 
 if not TYPE_CHECKING:
     from PySide.QtGui import QGraphicsOpacityEffect, QCompleter
@@ -748,6 +749,7 @@ class VarEditPage(UIPage):
     messages: ui.QLabel
     references: ReferencesTable
     options: ui.InputTextMultilineWidget
+    sort_order_input: ui.InputQuantity # Add attribute for the new input
 
     def __init__(
         self,
@@ -801,6 +803,13 @@ class VarEditPage(UIPage):
                         completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
                         completer.setFilterMode(ui.Qt.MatchFlag.MatchContains)
 
+                    ui.TextLabel(str(dtr("Vars", "Sort Order:"))) # Add label for Sort Order
+                    self.sort_order_input = ui.InputQuantity( # Add input for Sort Order
+                        value=0,
+                        widget_type="Gui::SpinBox", # Use SpinBox for integer input
+                        minimum=0, # Assuming non-negative sort order
+                    )
+
                     ui.TextLabel(str(dtr("Vars", "Description:")))
                     self.description = ui.InputTextMultiline(
                         value="",
@@ -846,6 +855,7 @@ class VarEditPage(UIPage):
         self.groups.setOptions({v: v for v in get_groups()})
         self.options.setText("")
         self.references.table.parent().hide()
+        self.sort_order_input.setValue(0) # Set default sort order for new variable
 
     def init_edit(self, var: Variable) -> None:
         self.var = var
@@ -861,9 +871,9 @@ class VarEditPage(UIPage):
         self.references.update(var)
         self.messages.setText("")
         self.messages.hide()
+        # Assuming the Variable object has a 'SortOrder' property
+        self.sort_order_input.setValue(getattr(var.varset, "SortOrder", 0))
 
-    def on_cancel(self) -> None:
-        self.event_bus.goto_home.emit()
 
     def on_save(self) -> None:
         self.messages.hide()
@@ -882,6 +892,8 @@ class VarEditPage(UIPage):
         else:
             options = None
 
+        sort_order = self.sort_order_input.value() # Get the sort order value
+
         if self.var is None and (
             err := self.editor.do_create_var(
                 name=self.name.text().strip(),
@@ -889,6 +901,7 @@ class VarEditPage(UIPage):
                 group=var_group,
                 description=self.description.value().strip(),
                 options=options,
+                sort_order=sort_order, # Pass sort order to create
             )
         ):
             self.messages.setText(err)
@@ -902,11 +915,16 @@ class VarEditPage(UIPage):
                 group=var_group,
                 description=self.description.value().strip(),
                 options=options,
+                sort_order=sort_order, # Pass sort order to edit
             )
         ):
             self.messages.setText(err)
             self.messages.show()
             return
+
+    def on_cancel(self) -> None:
+        """Handle the cancel action."""
+        self.editor.event_bus.goto_home.emit()
 
 
 class ReferencesTable:
@@ -1192,7 +1210,9 @@ class VariablesEditor(QObject):
     def get_groups(self) -> dict[str, list[Variable]]:
         supported_types = get_supported_property_types()
         variables = [v for v in get_vars(self.doc) if v.var_type in supported_types]
-        return groupby(sorted(variables, key=lambda v: v.group), lambda v: v.group)
+        # Sort by SortOrder first, then by group, then by name
+        # Assuming Variable object has a SortOrder property, default to 0 if not present
+        return groupby(sorted(variables, key=lambda v: (getattr(v.varset, "SortOrder", 0), v.group, v.name)), lambda v: v.group)
 
     def init_events(self) -> None:
         bus = self.event_bus
@@ -1292,6 +1312,7 @@ class VariablesEditor(QObject):
         group: str,
         description: str,
         options: list[str] | None,
+        sort_order: int, # Add sort_order parameter
     ) -> str | None:
         try:
             var = create_var(
@@ -1301,8 +1322,12 @@ class VariablesEditor(QObject):
                 description=description,
                 options=options,
                 doc=self.doc,
+                sort_order=sort_order, # Pass sort order to create
             )
             if var:
+                # Assuming the Variable object has a writable 'SortOrder' property
+                # This line is no longer needed as SortOrder is set in create_var
+                # setattr(var, "SortOrder", sort_order)
                 self.event_bus.var_created.emit(Variable(self.doc, name))
                 self.event_bus.goto_home.emit()
             else:
@@ -1318,6 +1343,7 @@ class VariablesEditor(QObject):
         group: str,
         description: str,
         options: list[str] | None,
+        sort_order: int, # Add sort_order parameter
     ) -> str | None:
         if description != var.description:
             var.description = description
@@ -1330,6 +1356,22 @@ class VariablesEditor(QObject):
 
         if options and (options != var.options):
             var.options = options
+
+        # Check if SortOrder property exists before setting it
+        if not hasattr(var.varset, "SortOrder"):
+             # Add the SortOrder property if it doesn't exist
+             var.varset.addProperty(
+                "App::PropertyInteger",
+                "SortOrder",
+                "",
+                "Sort order for display in the editor",
+                PropertyMode.Output | PropertyMode.NoRecompute,
+            )
+
+        # Set the SortOrder property
+        if getattr(var.varset, "SortOrder", 0) != sort_order:
+             var.varset.SortOrder = sort_order
+
 
         self.event_bus.var_edited.emit(var)
         return None

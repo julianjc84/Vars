@@ -1397,6 +1397,8 @@ class InputQuantityWidget(QWidget):
 
     def __init__(self, editor: QWidget) -> None:
         super().__init__()
+        # Set the parent of the editor widget before adding it to the layout
+        editor.setParent(self)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.setLayout(QVBoxLayout(self))
         self.setContentsMargins(0, 0, 0, 0)
@@ -1585,7 +1587,19 @@ def InputQuantity(
         msg = f"Invalid property name: {property}"
         raise ValueError(msg)
 
-    editor: QWidget = _fc_ui_loader.createWidget(widget_type)
+    editor: QWidget | None = _fc_ui_loader.createWidget(widget_type)
+
+    # Fallback for Gui::SpinBox if not available
+    if editor is None and widget_type == "Gui::SpinBox":
+        editor = QSpinBox()
+        # Map QSpinBox signals/slots to expected InputQuantityWidget interface
+        editor.valueChanged.connect(lambda v: editor.setProperty("rawValue", v))
+        editor.setProperty("rawValue", editor.value()) # Initialize rawValue
+
+    if editor is None:
+        msg = f"Failed to create widget of type: {widget_type}"
+        raise RuntimeError(msg)
+
     widget = InputQuantityWidget(editor)
     if min is not None:
         widget.setMinimum(min)
@@ -2254,6 +2268,7 @@ def button(
     ~:code:../examples/ui/widgets.py[buttons]:~
 
     :param str label: text of the button, defaults to None
+
     :param bool tool: use tool style button, defaults to False
     :param Union[QIcon, str] icon: icon, defaults to None
     :param int stretch: layout stretch, defaults to 0

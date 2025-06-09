@@ -50,6 +50,7 @@ def create_var(
     expression: str | None = None,
     group: str = "Default",
     doc: Document | None = None,
+    sort_order: int = 0,
 ) -> bool:
     """
     Create a variable in a document.
@@ -63,6 +64,7 @@ def create_var(
     :param expression: The expression to calculate the value of the variable, defaults to None.
     :param group: The group where to create the variable, defaults to "Default".
     :param doc: The document where to create the variable, defaults to the active document.
+    :param sort_order: The sort order for the variable, defaults to 0.
     :return: True if the variable was created, False otherwise.
     """
     name = sanitize_var_name(name)
@@ -83,8 +85,6 @@ def create_var(
     varset.Label = name
     if hasattr(varset, "Label2"):
         varset.Label2 = description
-    if callable(options):
-        options = options()
     varset.addProperty(var_type, "Value", "", description, enum_vals=options)
     varset.addProperty(
         "App::PropertyString",
@@ -100,6 +100,15 @@ def create_var(
         "Variable Group",
         PropertyMode.Output | PropertyMode.NoRecompute,
     )
+    varset.addProperty(
+        "App::PropertyInteger",
+        "SortOrder",
+        "",
+        "Sort order for display in the editor",
+        PropertyMode.Output | PropertyMode.NoRecompute,
+    )
+    varset.SortOrder = sort_order
+
     if expression:
         varset.setExpression("Value", expression, "Calculated")
         varset.recompute()
@@ -622,6 +631,7 @@ class Variable:
         description: str = "",
         expression: str | None = None,
         group: str = "Default",
+        sort_order: int = 0,
     ) -> Variable:
         """
         Create a variable if it doesn't exist.
@@ -635,6 +645,8 @@ class Variable:
                         defaults to None.
         :param description: The description of the variable, defaults to "".
         :param expression: The expression to calculate the value of the variable, defaults to None.
+        :param group: The group where to create the variable, defaults to "Default".
+        :param sort_order: The sort order for the variable, defaults to 0.
         :return: self
         """
         create_var(
@@ -646,6 +658,7 @@ class Variable:
             expression=expression,
             doc=self._doc,
             group=group,
+            sort_order=sort_order,
         )
         return self
 
