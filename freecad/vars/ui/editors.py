@@ -40,8 +40,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
     from FreeCAD import Document, DocumentObject  # type: ignore
-    from PySide6.QtWidgets import QGraphicsOpacityEffect, QCompleter, QMenu, QAbstractSpinBox
-    from PySide6.QtCore import QSettings, QObject, QEvent
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QCompleter, QMenu, QAbstractSpinBox # type: ignore
+    from PySide6.QtCore import QSettings, QObject, QEvent # type: ignore
 
 if not TYPE_CHECKING:
     from PySide.QtGui import QGraphicsOpacityEffect, QCompleter, QMenu, QAbstractSpinBox
