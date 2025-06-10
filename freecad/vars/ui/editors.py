@@ -1314,6 +1314,7 @@ class VariablesEditor(QObject):
         self.q_settings.setValue("y", pos.y())
         self.q_settings.setValue("w", size.width())
         self.q_settings.setValue("h", size.height())
+        print(f"Window: Pos=(X={pos.x()}, Y={pos.y()}), Size=(W={size.width()}, H={size.height()})")
 
     def get_groups(self) -> dict[str, list[Variable]]:
         supported_types = get_supported_property_types()
