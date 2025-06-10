@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import cache
 import re
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from freecad.vars.vendor.fcapi.events import events
@@ -40,12 +41,12 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
     from FreeCAD import Document, DocumentObject  # type: ignore
-    from PySide6.QtWidgets import QGraphicsOpacityEffect, QCompleter, QMenu, QAbstractSpinBox
-    from PySide6.QtCore import QSettings, QObject, QEvent
+    from PySide6.QtWidgets import QGraphicsOpacityEffect, QCompleter, QMenu, QAbstractSpinBox, QApplication
+    from PySide6.QtCore import QSettings, QObject, QEvent, QTimer
 
 if not TYPE_CHECKING:
-    from PySide.QtGui import QGraphicsOpacityEffect, QCompleter, QMenu, QAbstractSpinBox
-    from PySide.QtCore import QSettings, QObject, QEvent
+    from PySide.QtGui import QGraphicsOpacityEffect, QCompleter, QMenu, QAbstractSpinBox, QApplication
+    from PySide.QtCore import QSettings, QObject, QEvent, QTimer
 
 style_vars = {
     "border_color": TEXT_COLOR,
@@ -717,9 +718,9 @@ class HomePage(UIPage):
         return col
 
     def reload_content(self) -> None:
-        self.dialog.close()
-        if doc := App.activeDocument():
-            VariablesEditor(doc)
+        from freecad.vars.commands import EditVars
+
+        App.Gui.runCommand(EditVars.name)
 
     def on_request_focus(self, name: str) -> None:
         def task() -> None:
@@ -1259,20 +1260,25 @@ class VariablesEditor(QObject):
 
     q_settings = QSettings("FreeCAD", "mnesarco-Vars")
 
+    QObjectName = "Vars_EditorInstance"
+
     def __init__(self, doc: Document) -> None:
-        super().__init__()
+        super().__init__(App.Gui.getMainWindow())
+        self.setObjectName(self.QObjectName)
         self.doc = doc
         groups = self.get_groups()
+        x, y, w, h = self.get_geometry()
 
         with ui.Dialog(
             title=str(dtr("Vars", "Variables")),
             styleSheet=stylesheet,
             modal=False,
+            parent=App.Gui.getMainWindow(),
+            size=(w, h),
         ) as dialog:
-            dialog.setAttribute(ui.Qt.WidgetAttribute.WA_DeleteOnClose)
+            dialog.setAttribute(ui.Qt.WidgetAttribute.WA_DeleteOnClose, False)
             self.dialog = dialog
             self.event_bus = EventBus(self)
-            self.setParent(dialog)
             with ui.Stack() as pages:
                 self.pages = pages.layout()
                 self.home_page = HomePage(self, groups, dialog)
@@ -1281,39 +1287,68 @@ class VariablesEditor(QObject):
                 self.references_page = VarReferencesPage(self, dialog)
                 self.delete_page = VarDeletePage(self, dialog)
 
-            x, y, w, h = self.get_geometry()
-            if w and h:
-                dialog.resize(w, h)
-            if x or y:
-                dialog.move(x, y)
+        if x or y:
+            dialog.setGeometry(x, y, w, h)
+        QTimer.singleShot(0, self.ensure_valid_geometry)
 
         self.init_events()
         self.cmd_filter()
 
-        @events.document.activated
-        def on_document_activate(event: events.DocumentEvent) -> None:
-            if event.doc != self.doc:
-                on_document_activate.unsubscribe()
-                with contextlib.suppress(Exception):
-                    dialog.close()  # TODO(mnesarco): Investigate lifecycle issue
-
         dialog.onMove.connect(self.on_move_or_resize)
         dialog.onResize.connect(self.on_move_or_resize)
+        dialog.onClose.connect(self.on_dialog_destroyed)
+        dialog.destroyed.connect(self.on_dialog_destroyed)
+        self.destroyed.connect(self.on_destroyed)
+
+        def on_document_activated(event: events.DocumentEvent) -> None:
+            from freecad.vars.commands import EditVars
+
+            if event.doc != self.doc:
+                QTimer.singleShot(0, lambda: App.Gui.runCommand(EditVars.name))
+
+        self.on_document_activated = events.document.activated(on_document_activated)
+
+    def unsubscribe(self) -> None:
+        if self.on_document_activated:
+            with suppress(RuntimeWarning):
+                self.on_document_activated.unsubscribe()
+            self.on_document_activated = None
+
+    def on_dialog_destroyed(self) -> None:
+        self.unsubscribe()
+        self.dialog = None
+
+    def close(self) -> None:
+        self.on_destroyed()
+        self.deleteLater()
+
+    def on_destroyed(self) -> None:
+        self.unsubscribe()
+        if self.dialog:
+            self.dialog.close()
+            self.dialog.deleteLater()
+
+    def ensure_valid_geometry(self) -> None:
+        dialog_geom = self.dialog.frameGeometry()
+        for screen in (s.availableGeometry() for s in QApplication.screens()):
+            if screen.intersects(dialog_geom):
+                return
+        screen_center = QApplication.primaryScreen().availableGeometry().center()
+        self.dialog.move(screen_center - dialog_geom.center())
 
     def get_geometry(self) -> tuple[int, int, int, int]:
         x = self.q_settings.value("x", 0, int)
         y = self.q_settings.value("y", 0, int)
-        w = self.q_settings.value("w", 800, int)
-        h = self.q_settings.value("h", 600, int)
-        return x, y, w, h
+        w = self.q_settings.value("w", 0, int)
+        h = self.q_settings.value("h", 0, int)
+        return max(x, 0), max(y, 0), max(w, 400), max(h, 500)
 
     def on_move_or_resize(self, _e) -> None:
-        pos = self.dialog.pos()
-        size = self.dialog.size()
-        self.q_settings.setValue("x", pos.x())
-        self.q_settings.setValue("y", pos.y())
-        self.q_settings.setValue("w", size.width())
-        self.q_settings.setValue("h", size.height())
+        geom = self.dialog.geometry()
+        self.q_settings.setValue("x", geom.left())
+        self.q_settings.setValue("y", geom.top())
+        self.q_settings.setValue("w", geom.width())
+        self.q_settings.setValue("h", geom.height())
 
     def get_groups(self) -> dict[str, list[Variable]]:
         supported_types = get_supported_property_types()
