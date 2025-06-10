@@ -1281,11 +1281,55 @@ class VariablesEditor(QObject):
                 self.references_page = VarReferencesPage(self, dialog)
                 self.delete_page = VarDeletePage(self, dialog)
 
-            x, y, w, h = self.get_geometry()
-            if w and h:
-                dialog.resize(w, h)
-            if x or y:
-                dialog.move(x, y)
+            # Determine screen geometry
+            screen = ui.QApplication.primaryScreen()
+            # Use availableGeometry to account for taskbars, etc.
+            screen_rect = screen.availableGeometry() if screen else ui.QRect(0, 0, 1920, 1080) # Fallback
+
+            print(f"Screen available geometry: X={screen_rect.x()}, Y={screen_rect.y()}, Width={screen_rect.width()}, Height={screen_rect.height()}")
+
+            # Get last saved/default geometry
+            stored_x, stored_y, stored_w, stored_h = self.get_geometry()
+            print(f"Window last saved/default geometry: X={stored_x}, Y={stored_y}, W={stored_w}, H={stored_h}")
+
+            # Effective dimensions to check and use initially (stored_w, stored_h default to 800,600)
+            current_w = max(100, stored_w) 
+            current_h = max(100, stored_h)
+
+            # Check if the window is off-screen or inappropriately sized
+            is_problematic = (
+                stored_x < screen_rect.x() or
+                stored_y < screen_rect.y() or
+                stored_x + current_w > screen_rect.x() + screen_rect.width() or
+                stored_y + current_h > screen_rect.y() + screen_rect.height() or
+                current_w > screen_rect.width() or # Saved width is too large for current screen
+                current_h > screen_rect.height()   # Saved height is too large for current screen
+            )
+
+            if is_problematic:
+                print("Window's last position/size is problematic. Resetting to safe defaults.")
+                # Target "safe position of 800 600" means size 800x600
+                target_w = 800
+                target_h = 600
+
+                # Adjust target size to fit screen, ensuring minimums
+                final_w = max(100, min(target_w, screen_rect.width()))
+                final_h = max(100, min(target_h, screen_rect.height()))
+
+                # Center on screen's available geometry
+                final_x = screen_rect.x() + (screen_rect.width() - final_w) // 2
+                final_y = screen_rect.y() + (screen_rect.height() - final_h) // 2
+                
+                print(f"New geometry: X={final_x}, Y={final_y}, W={final_w}, H={final_h}")
+            else:
+                # Use stored/current geometry as it's on-screen
+                final_x, final_y = stored_x, stored_y
+                # Ensure current_w/h (which might be from settings) are not larger than screen
+                # and maintain minimum size
+                final_w = max(100, min(current_w, screen_rect.width()))
+                final_h = max(100, min(current_h, screen_rect.height()))
+
+            dialog.setGeometry(final_x, final_y, final_w, final_h)
 
         self.init_events()
         self.cmd_filter()
