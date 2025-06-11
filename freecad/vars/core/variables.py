@@ -41,6 +41,43 @@ def get_vars_group(doc: Document | None = None) -> DocumentObject:
     return group
 
 
+def _get_or_assign_initial_group_sort_key(group_name: str, doc: Document | None) -> int:
+    print(f"DEV: _get_or_assign_initial_group_sort_key for group: {group_name}")
+    _doc = doc or App.ActiveDocument
+    if not _doc:
+        print("DEV: ERROR - No document in _get_or_assign_initial_group_sort_key")
+        return -1  # Should not happen if called correctly
+
+    all_gsk_values = []
+    processed_groups_keys: dict[str, int] = {}
+
+    for var_obj in get_vars(_doc):  # Using existing get_vars
+        if hasattr(var_obj.varset, "GroupSortKey"):
+            gsk = var_obj.varset.GroupSortKey
+            if var_obj.group not in processed_groups_keys:
+                processed_groups_keys[var_obj.group] = gsk
+            # Ensure consistency if multiple vars in same group have different GSK (should not happen)
+            elif processed_groups_keys[var_obj.group] != gsk:
+                print(
+                    f"DEV: WARNING - Inconsistent GroupSortKey for group {var_obj.group}. Using first encountered: {processed_groups_keys[var_obj.group]}"
+                )
+
+    if group_name in processed_groups_keys:
+        print(
+            f"DEV: Found existing GroupSortKey for {group_name}: {processed_groups_keys[group_name]}"
+        )
+        return processed_groups_keys[group_name]
+
+    # New group, assign new key
+    current_max_gsk = -1
+    if processed_groups_keys:
+        current_max_gsk = max(processed_groups_keys.values())
+
+    new_gsk = current_max_gsk + 1
+    print(f"DEV: Assigning new GroupSortKey for {group_name}: {new_gsk}")
+    return new_gsk
+
+
 def create_var(
     *,
     name: str,
@@ -52,20 +89,13 @@ def create_var(
     group: str = "Default",
     doc: Document | None = None,
 ) -> bool:
-    """
-    Create a variable in a document.
+    print(f"DEV: create_var called for: {name}, group: {group}")
+    # Ensure doc is resolved
+    _doc = doc or App.ActiveDocument
+    if not _doc:
+        print("DEV: ERROR - No document in create_var")
+        return False
 
-    :param name: The label name of the variable.
-    :param var_type: The type of the variable (App::Property*).
-    :param value: The value of the variable, defaults to None.
-    :param options: A list of options for the variable if var_type is "App::PropertyEnumeration",
-                    defaults to None.
-    :param str description: The description of the variable, defaults to "".
-    :param expression: The expression to calculate the value of the variable, defaults to None.
-    :param group: The group where to create the variable, defaults to "Default".
-    :param doc: The document where to create the variable, defaults to the active document.
-    :return: True if the variable was created, False otherwise.
-    """
     name = sanitize_var_name(name)
     doc = doc or App.activeDocument()
 
@@ -135,6 +165,31 @@ def create_var(
 
     if preferences.hide_varsets():
         varset.ViewObject.ShowInTree = False
+
+    # At the point of adding properties to varset:
+    if not hasattr(varset, "GroupSortKey"):
+        print(f"DEV: Adding GroupSortKey property to varset for {name}")
+        varset.addProperty(
+            "App::PropertyInteger",
+            "GroupSortKey",
+            "",
+            "Group Sort Key",
+            PropertyMode.Output | PropertyMode.NoRecompute,
+        )
+        initial_gsk = _get_or_assign_initial_group_sort_key(group, _doc)
+        varset.GroupSortKey = initial_gsk
+        print(f"DEV: Set initial GroupSortKey for {name} (group {group}) to: {initial_gsk}")
+    elif varset.GroupSortKey is None:  # Or some other check if it might exist but be uninitialized
+        # This case might occur if property was added but not set, or old file.
+        initial_gsk = _get_or_assign_initial_group_sort_key(group, _doc)
+        varset.GroupSortKey = initial_gsk
+        print(f"DEV: Varset {name} had GroupSortKey property but no value. Set to: {initial_gsk}")
+    else:
+        # If var is being moved to a new group, its GSK might need update here or elsewhere
+        print(f"DEV: Varset {name} already has GroupSortKey: {varset.GroupSortKey}. Group: {group}")
+        # If the variable's group is changing, we might need to update its GSK
+        # This logic might be better handled when a variable's group property is changed.
+        # For now, assume create_var is for new vars or vars where group is already correct.
 
     get_vars_group(doc).addObject(varset)
 
@@ -814,6 +869,29 @@ class Variable:
             )
         varset.SortKey = key
 
+    @property
+    def group_sort_key(self) -> int:
+        try:
+            gsk = self.varset.GroupSortKey
+            # print(f"DEV: Variable {self.name} accessed group_sort_key: {gsk}")
+            return gsk
+        except AttributeError:
+            print(f"DEV: AttributeError for GroupSortKey on {self.name}. Attempting to initialize.")
+            _doc = self.document or App.ActiveDocument
+            if hasattr(self.varset, "addProperty") and _doc and not _doc.isRestoring():
+                 self.varset.addProperty("App::PropertyInteger", "GroupSortKey", "", "Group Sort Key", PropertyMode.Output | PropertyMode.NoRecompute)
+                 # Re-fetch or assign carefully
+                 # This might indicate an issue with initial creation or file load
+                 # We need to ensure all variables in the same group get the same key
+                 # This might be a good place for a "repair" or "ensure consistency" function
+                 # For now, let's try to get it based on its current group
+                 initial_gsk = _get_or_assign_initial_group_sort_key(self.group, _doc)
+                 self.varset.GroupSortKey = initial_gsk
+                 print(f"DEV: Initialized and set GroupSortKey for {self.name} to {initial_gsk}")
+                 return self.varset.GroupSortKey
+            print(f"DEV: Could not initialize GroupSortKey for {self.name}. Returning default 0.")
+            return 0 # Default if unable to set
+
     def reorder(self, delta: float) -> None:
         group = self.group
         group_vars = sorted(v for v in get_vars() if v.group == group)
@@ -878,3 +956,129 @@ def existing_var_name(name: str, doc: Document | None = None) -> str | None:
         if is_var(obj) and obj.Label.lower() == name:
             return obj.Label
     return None
+
+
+def reorder_group(group_name_to_move: str, delta: float, doc: Document | None = None) -> bool:
+    print(f"DEV: reorder_group called for group '{group_name_to_move}', delta: {delta}")
+    _doc = doc or App.ActiveDocument
+    if not _doc:
+        print("DEV: ERROR - No document in reorder_group")
+        return False
+
+    # 1. Get current groups and their sort keys
+    #    Store as list of dicts: [{'name': str, 'key': int}]
+    #    We need one representative key per group.
+    groups_data: dict[str, int] = {}  # group_name -> group_sort_key
+    all_vars = get_vars(_doc)
+    for var_item in all_vars:
+        try:
+            gsk = var_item.varset.GroupSortKey
+            if var_item.group not in groups_data:
+                groups_data[var_item.group] = gsk
+            elif groups_data[var_item.group] != gsk:
+                # This indicates an inconsistency. For reordering, we might pick one or average,
+                # but ideally, all vars in a group have the same GSK.
+                # For now, let's assume the first one encountered is "correct" for that group.
+                print(
+                    f"DEV: WARNING - Inconsistent GroupSortKey for group {var_item.group} during reorder. Using {groups_data[var_item.group]}. Var {var_item.name} has {gsk}"
+                )
+        except AttributeError:
+            print(
+                f"DEV: ERROR - Variable {var_item.name} in group {var_item.group} missing GroupSortKey during reorder."
+            )
+            # Attempt to fix it on the fly - this is risky but might help for older files
+            if hasattr(var_item.varset, "addProperty") and not _doc.isRestoring():
+                var_item.varset.addProperty(
+                    "App::PropertyInteger",
+                    "GroupSortKey",
+                    "",
+                    "Group Sort Key",
+                    PropertyMode.Output | PropertyMode.NoRecompute,
+                )
+                fix_gsk = _get_or_assign_initial_group_sort_key(
+                    var_item.group, _doc
+                )  # This will try to assign based on current state
+                var_item.varset.GroupSortKey = fix_gsk
+                groups_data[var_item.group] = fix_gsk  # Add it to our current understanding
+                print(f"DEV: Fixed and set GroupSortKey for {var_item.name} to {fix_gsk}")
+            else:
+                return False  # Cannot proceed if data is corrupt and cannot be fixed
+
+    if not groups_data:
+        print("DEV: No groups found to reorder.")
+        return False
+
+    # Convert to list of dicts and sort by current key, then name for stability
+    sorted_groups = sorted(
+        [{"name": g_name, "key": g_key} for g_name, g_key in groups_data.items()],
+        key=lambda x: (x["key"], x["name"]),
+    )
+    print(f"DEV: Groups before reorder: {sorted_groups}")
+
+    # Find the group to move
+    current_pos_idx = -1
+    for idx, g_data in enumerate(sorted_groups):
+        if g_data["name"] == group_name_to_move:
+            current_pos_idx = idx
+            break
+
+    if current_pos_idx == -1:
+        print(f"DEV: ERROR - Group '{group_name_to_move}' not found for reordering.")
+        return False
+
+    # Calculate new index
+    num_groups = len(sorted_groups)
+    if delta == float("-inf"):  # Move to top
+        new_pos_idx = 0
+    elif delta == float("inf"):  # Move to bottom
+        new_pos_idx = num_groups - 1
+    else:  # Move up/down by 1
+        new_pos_idx = current_pos_idx + int(delta)
+
+    new_pos_idx = max(0, min(new_pos_idx, num_groups - 1))
+    print(f"DEV: Moving '{group_name_to_move}' from index {current_pos_idx} to {new_pos_idx}")
+
+    if new_pos_idx == current_pos_idx:
+        print("DEV: Group is already in the target position.")
+        return False  # No change needed
+
+    # Reorder: remove and insert
+    group_to_move_item = sorted_groups.pop(current_pos_idx)
+    sorted_groups.insert(new_pos_idx, group_to_move_item)
+    print(f"DEV: Groups after reorder (before updating keys): {sorted_groups}")
+
+    # Update GroupSortKey for all variables in all groups based on their new order.
+    # And re-normalize keys to be contiguous from 0.
+    changes_made = False
+    for new_key_idx, group_data_item in enumerate(sorted_groups):
+        target_group_name = group_data_item["name"]
+        # Update all vars belonging to this group
+        for var_item in all_vars:  # Iterate through all_vars again
+            if var_item.group == target_group_name:
+                if not hasattr(var_item.varset, "GroupSortKey"):  # Should exist by now
+                    print(
+                        f"DEV: ERROR - Varset for {var_item.name} missing GroupSortKey during final update."
+                    )
+                    # Attempt to add it again, though this indicates a deeper issue
+                    var_item.varset.addProperty(
+                        "App::PropertyInteger",
+                        "GroupSortKey",
+                        "",
+                        "Group Sort Key",
+                        PropertyMode.Output | PropertyMode.NoRecompute,
+                    )
+
+                if var_item.varset.GroupSortKey != new_key_idx:
+                    print(
+                        f"DEV: Updating GroupSortKey for var '{var_item.name}' (group '{target_group_name}') from {var_item.varset.GroupSortKey} to {new_key_idx}"
+                    )
+                    var_item.varset.GroupSortKey = new_key_idx
+                    changes_made = True
+
+    if changes_made:
+        print("DEV: GroupSortKeys updated. Requesting document recompute.")
+        _doc.recompute()  # Important to persist changes
+    else:
+        print("DEV: No actual GroupSortKey values needed to be changed after reordering logic.")
+
+    return changes_made

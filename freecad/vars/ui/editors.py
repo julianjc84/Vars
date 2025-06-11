@@ -18,11 +18,13 @@ from freecad.vars.vendor.fcapi import fcui as ui
 from freecad.vars.api import (
     Variable,
     get_vars,
-    get_groups,
+    get_groups, # Uncommented this line
     create_var,
     export_variables,
     import_variables,
 )
+from freecad.vars.core.variables import reorder_group
+
 from freecad.vars.core.properties import (
     PROPERTY_INFO,
     PropertyAccessorAdapter,
@@ -135,6 +137,58 @@ def add_action(
     return action
 
 
+class LockEventFilter(QObject):
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        # This filter is intended to make an editor read-only.
+        # It should consume events that would modify the editor's content.
+        # For example, for a QLineEdit or QAbstractSpinBox:
+        if event.type() in [
+            QEvent.Type.KeyPress,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.ContextMenu,
+        ]:
+            # For some widgets, you might also need to set them to read-only directly.
+            # This event filter provides an additional layer or handles cases
+            # where direct read-only status is insufficient or needs dynamic toggling.
+            return True # Event consumed, stop further processing
+        return super().eventFilter(watched, event)
+
+    def install(self, widget: ui.QWidget) -> None:
+        widget.installEventFilter(self)
+
+    def uninstall(self, widget: ui.QWidget) -> None:
+        widget.removeEventFilter(self)
+
+
+class ScrollEventFilter(QObject):
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        # This filter is often used to prevent scroll wheel events from
+        # changing values in input fields when the user is trying to scroll the page.
+        if event.type() == QEvent.Type.Wheel:
+            # Optionally, check if the widget has focus before ignoring scroll
+            # if isinstance(watched, ui.QAbstractSpinBox) and not watched.hasFocus():
+            #    event.ignore()
+            #    return True
+            # For a simpler block:
+            if isinstance(watched, ui.QAbstractSpinBox): # Or other relevant widget types
+                 event.ignore() # Tell the event to be ignored by the widget
+                 return True    # Event handled, stop further processing by this filter path
+        return super().eventFilter(watched, event)
+
+    def install(self, widget: ui.QWidget) -> None:
+        widget.installEventFilter(self)
+
+    def uninstall(self, widget: ui.QWidget) -> None:
+        widget.removeEventFilter(self)
+
+
 class VarEditor(QObject):
     """Variable editor row."""
 
@@ -186,7 +240,7 @@ class VarEditor(QObject):
             with ui.Col(contentsMargins=(2, 0, 2, 0), spacing=0):
                 with ui.Row(contentsMargins=(0, 0, 0, 0), spacing=0):
                     self.label = ui.InputText(
-                        var_display_label(variable.group, variable.name),
+                        var_display_label(variable.group, variable.name), # This line calls the new helper
                         readOnly=True,
                         focusPolicy=ui.Qt.FocusPolicy.ClickFocus,
                         stretch=45,
@@ -527,23 +581,20 @@ class EventBus(QObject):
 
     reload_vars = ui.Signal()
 
+    request_group_move_top = ui.Signal(str) # Changed from Signal(str)
+    request_group_move_up = ui.Signal(str) # Changed from Signal(str)
+    request_group_move_down = ui.Signal(str) # Changed from Signal(str)
+    request_group_move_bottom = ui.Signal(str) # Changed from Signal(str)
+
     def __init__(self, *args) -> None:  # noqa: D107
         super().__init__(*args)
 
 
 class VarGroupSection(QObject):
-    """Variable group section."""
-
-    name: str
-    editors: list[VarEditor]
-    container: ui.QWidget
-    editors_layout: ui.QLayout
-    event_bus: EventBus
-
     def __init__(
         self,
         name: str,
-        variables: list[Variable],
+        variables: list[Variable], # Should be sorted by SortKey within this group
         event_bus: EventBus,
         add: bool = True,
         parent: QObject | None = None,
@@ -551,6 +602,7 @@ class VarGroupSection(QObject):
         super().__init__(parent)
         self.name = name
         self.event_bus = event_bus
+        print(f"DEV: VarGroupSection created for group: '{name}', with {len(variables)} variables.")
 
         with ui.GroupBox(
             title=name,
@@ -560,11 +612,28 @@ class VarGroupSection(QObject):
         ) as box:
             self.container = box
             box.groupInstance = self
-            with ui.Col(contentsMargins=(2, 2, 2, 2), spacing=0) as col:
-                self.editors_layout = col.layout()
-                self.editors = [
-                    VarEditor(var, event_bus, parent=self) for var in variables if var.group == name
-                ]
+            with ui.Col(contentsMargins=(2, 2, 2, 2), spacing=2) as col_in_groupbox:
+                # Group actions toolbar
+                with ui.Row(spacing=2, contentsMargins=(0,0,0,4)) as self.group_actions_toolbar:
+                    ui.Stretch(1) # Push buttons to the right
+                    
+                    tooltip_move_top_str = "Move group '{group_name}' to top".format(group_name=name)
+                    toolbar_button(icon="sort-top.svg", tooltip=dtr("Vars", tooltip_move_top_str), callback=lambda: self.event_bus.request_group_move_top.emit(self.name))
+                    
+                    tooltip_move_up_str = "Move group '{group_name}' up".format(group_name=name)
+                    toolbar_button(icon="sort-up.svg", tooltip=dtr("Vars", tooltip_move_up_str), callback=lambda: self.event_bus.request_group_move_up.emit(self.name))
+                    
+                    tooltip_move_down_str = "Move group '{group_name}' down".format(group_name=name)
+                    toolbar_button(icon="sort-down.svg", tooltip=dtr("Vars", tooltip_move_down_str), callback=lambda: self.event_bus.request_group_move_down.emit(self.name))
+                    
+                    tooltip_move_bottom_str = "Move group '{group_name}' to bottom".format(group_name=name)
+                    toolbar_button(icon="sort-bottom.svg", tooltip=dtr("Vars", tooltip_move_bottom_str), callback=lambda: self.event_bus.request_group_move_bottom.emit(self.name))
+
+                with ui.Col(contentsMargins=(0,0,0,0), spacing=0) as editors_col:
+                    self.editors_layout = editors_col.layout()
+                    self.editors = [
+                        VarEditor(var, event_bus, parent=self) for var in variables
+                    ]
 
         event_bus.var_delete_requested.connect(self.on_delete_requested)
         event_bus.var_reordered.connect(self.on_var_reordered)
@@ -661,10 +730,9 @@ class UIPage(QObject):
     ) -> None:
         super().__init__(parent)
         self.editor = editor
-        self.page_id = editor.pages.count()
+        self.page_id = editor.pages.count() # This is line 676
         self.event_bus = editor.event_bus
         self.dialog = editor.dialog
-        self.doc = editor.doc
 
 
 class HomePage(UIPage):
@@ -1350,10 +1418,59 @@ class VariablesEditor(QObject):
         self.q_settings.setValue("w", geom.width())
         self.q_settings.setValue("h", geom.height())
 
-    def get_groups(self) -> dict[str, list[Variable]]:
+    def get_groups(self) -> list[tuple[str, list[Variable]]]:
+        print("DEV: VariablesEditor.get_groups() called.")
         supported_types = get_supported_property_types()
-        variables = [v for v in get_vars(self.doc) if v.var_type in supported_types]
-        return groupby(sorted(variables), lambda v: v.group)
+        all_vars = [v for v in get_vars(self.doc) if v.var_type in supported_types]
+        print(f"DEV: get_groups - Found {len(all_vars)} supported variables.")
+
+        temp_groups_dict: dict[str, list[Variable]] = {}
+        for var_instance in all_vars:
+            # Access group_sort_key to ensure it's evaluated if lazy/defaulted
+            # and to catch potential errors early during UI build
+            try:
+                _ = var_instance.group_sort_key 
+            except Exception as e:
+                print(f"DEV: ERROR accessing group_sort_key for {var_instance.name} in get_groups: {e}")
+                # Decide how to handle - skip var, assign default, etc.
+                # For now, let it proceed, but this var might cause sorting issues.
+            temp_groups_dict.setdefault(var_instance.group, []).append(var_instance)
+        
+        print(f"DEV: get_groups - temp_groups_dict before sorting within groups: { {k: len(v) for k,v in temp_groups_dict.items()} }")
+
+        for group_name_key in temp_groups_dict:
+            temp_groups_dict[group_name_key].sort() # Relies on Variable.__lt__ (SortKey)
+        
+        group_items_for_sorting = []
+        for g_name, g_vars_list in temp_groups_dict.items():
+            if not g_vars_list:
+                print(f"DEV: WARNING - Group '{g_name}' has no variables in get_groups.")
+                continue
+            
+            # All vars in a group should share the same GroupSortKey. Take from the first.
+            # It's crucial that GroupSortKey is consistent for all vars in the same group.
+            # The core logic should ensure this.
+            representative_gsk = g_vars_list[0].group_sort_key 
+            # Sanity check:
+            for var_in_g in g_vars_list[1:]:
+                if var_in_g.group_sort_key != representative_gsk:
+                    print(f"DEV: WARNING - Inconsistent GroupSortKey in group '{g_name}' within get_groups! Var {var_in_g.name} ({var_in_g.group_sort_key}) vs {g_vars_list[0].name} ({representative_gsk})")
+                    # This could lead to unpredictable group sorting if not handled.
+                    # For now, we proceed with the GSK of the first variable.
+            
+            group_items_for_sorting.append(
+                {"name": g_name, "gsk": representative_gsk, "vars_count": len(g_vars_list), "vars": g_vars_list} # added vars_count for easier print
+            )
+        
+        print(f"DEV: get_groups - group_items_for_sorting (before sort by GSK): { [{'name': i['name'], 'gsk': i['gsk'], 'vars_count': i['vars_count']} for i in group_items_for_sorting] }")
+        
+        group_items_for_sorting.sort(key=lambda item: (item["gsk"], item["name"])) # Sort by GSK, then name
+        
+        print(f"DEV: get_groups - group_items_for_sorting (after sort by GSK): { [{'name': i['name'], 'gsk': i['gsk'], 'vars_count': i['vars_count']} for i in group_items_for_sorting] }")
+        
+        final_groups = [(item["name"], item["vars"]) for item in group_items_for_sorting]
+        print(f"DEV: get_groups - Returning {len(final_groups)} groups.")
+        return final_groups
 
     def init_events(self) -> None:
         bus = self.event_bus
@@ -1366,6 +1483,10 @@ class VariablesEditor(QObject):
         bus.var_edited.connect(self.on_var_edited)
         bus.var_editor_removed.connect(self.do_delete_var)
         bus.filter_changed.connect(self.cmd_filter)
+        bus.request_group_move_top.connect(self.cmd_group_move_top)
+        bus.request_group_move_up.connect(self.cmd_group_move_up)
+        bus.request_group_move_down.connect(self.cmd_group_move_down)
+        bus.request_group_move_bottom.connect(self.cmd_group_move_bottom)
 
     def do_delete_var(self, var: Variable) -> None:
         var.delete()
@@ -1378,6 +1499,38 @@ class VariablesEditor(QObject):
     def cmd_delete_var(self, var: Variable) -> None:
         self.delete_page.set_var(var)
         self.switch_to_page(self.delete_page)
+
+    def cmd_group_move_top(self, group_name: str) -> None:
+        print(f"DEV: cmd_group_move_top received for group: {group_name}")
+        if reorder_group(group_name, float("-inf"), self.doc):
+            print(f"DEV: cmd_group_move_top - reorder_group successful for {group_name}, emitting reload_vars.")
+            self.event_bus.reload_vars.emit()
+        else:
+            print(f"DEV: cmd_group_move_top - reorder_group returned False or no change for {group_name}.")
+
+    def cmd_group_move_up(self, group_name: str) -> None:
+        print(f"DEV: cmd_group_move_up received for group: {group_name}")
+        if reorder_group(group_name, -1.0, self.doc): 
+            print(f"DEV: cmd_group_move_up - reorder_group successful for {group_name}, emitting reload_vars.")
+            self.event_bus.reload_vars.emit()
+        else:
+            print(f"DEV: cmd_group_move_up - reorder_group returned False or no change for {group_name}.")
+
+    def cmd_group_move_down(self, group_name: str) -> None:
+        print(f"DEV: cmd_group_move_down received for group: {group_name}")
+        if reorder_group(group_name, 1.0, self.doc): 
+            print(f"DEV: cmd_group_move_down - reorder_group successful for {group_name}, emitting reload_vars.")
+            self.event_bus.reload_vars.emit()
+        else:
+            print(f"DEV: cmd_group_move_down - reorder_group returned False or no change for {group_name}.")
+
+    def cmd_group_move_bottom(self, group_name: str) -> None:
+        print(f"DEV: cmd_group_move_bottom received for group: {group_name}")
+        if reorder_group(group_name, float("inf"), self.doc):
+            print(f"DEV: cmd_group_move_bottom - reorder_group successful for {group_name}, emitting reload_vars.")
+            self.event_bus.reload_vars.emit()
+        else:
+            print(f"DEV: cmd_group_move_bottom - reorder_group returned False or no change for {group_name}.")
 
     def on_var_created(self, var: Variable) -> None:
         for section in self.sections:
@@ -1518,80 +1671,18 @@ class VariablesEditor(QObject):
             return str(e)
 
 
-@cache
-def var_display_label(group: str, name: str) -> str:
-    """Get the display label for a variable."""
-    try:
-        parts = [p for p in _DISPLAY_LABEL_SEP.split(name) if p]
-        if len(parts) > 1 and group.lower() == parts[0].lower():
-            parts.pop(0)
-        return " ".join(p.capitalize() for p in parts)
-    except Exception:  # noqa: BLE001
-        return name
+# fmt: on
 
-
-class ScrollEventFilter(QObject):
-    """
-    Prevents accidental changes on scroll.
-    """
-
-    def __init__(self, parent: QObject | None = None) -> None:
-        super().__init__(parent)
-
-    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        if event.type() == QEvent.Type.Wheel:
-            return not (isinstance(obj, ui.QWidget) and obj.hasFocus())
-        return super().eventFilter(obj, event)
-
-    def install(self, target: ui.QWidget) -> None:
-        for child in chain(target.findChildren(ui.QWidget), [target]):
-            if isinstance(child, QAbstractSpinBox):
-                child.installEventFilter(self)
-                child.setFocusPolicy(ui.Qt.FocusPolicy.StrongFocus)
-
-
-class LockEventFilter(QObject):
-    """
-    Lock input without disabling the widget.
-    """
-
-    interactive_events = frozenset((
-        QEvent.Type.MouseButtonPress,
-        QEvent.Type.MouseButtonRelease,
-        QEvent.Type.MouseButtonDblClick,
-        QEvent.Type.KeyPress,
-        QEvent.Type.KeyRelease,
-        QEvent.Type.Wheel,
-        QEvent.Type.FocusIn,
-        QEvent.Type.FocusOut,
-        QEvent.Type.Enter,
-        QEvent.Type.Leave,
-        # QEvent.Type.HoverEnter,
-        # QEvent.Type.HoverLeave,
-        # QEvent.Type.HoverMove,
-        QEvent.Type.ContextMenu,
-        QEvent.Type.TouchBegin,
-        QEvent.Type.TouchUpdate,
-        QEvent.Type.TouchEnd,
-    ))
-
-    def __init__(self, parent: QObject | None = None) -> None:
-        super().__init__(parent)
-
-    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        if event.type() in LockEventFilter.interactive_events:
-            return True
-        return super().eventFilter(obj, event)
-
-    def install(self, target: ui.QWidget) -> None:
-        target.installEventFilter(self)
-        for child in target.findChildren(ui.QWidget):
-            child.installEventFilter(self)
-
-    def uninstall(self, target: ui.QWidget) -> None:
-        target.removeEventFilter(self)
-        for child in target.findChildren(ui.QWidget):
-            child.removeEventFilter(self)
-
-
+# Helpers
+# ----------------------------------------------------------------------------
 _DISPLAY_LABEL_SEP = re.compile(r"_|(?=[A-Z])")
+
+def var_display_label(group: str, name: str) -> str:
+    """
+    Create a display label for a variable.
+    This returns the variable's name. The group context is handled by the VarGroupSection.
+    """
+    # Original logic:
+    # if group and group.lower() != "default":
+    #     return f"{group} / {name}"
+    return name
