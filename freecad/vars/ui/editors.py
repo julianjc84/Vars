@@ -20,7 +20,6 @@ from freecad.vars.api import (
     VarGroup,
     Variable,
     create_var,
-    display_label,
     export_variables,
     get_groups,
     import_variables,
@@ -49,6 +48,7 @@ if TYPE_CHECKING:
         QApplication,
         QCompleter,
         QGraphicsOpacityEffect,
+        QInputDialog,
         QMenu,
         QSlider,
         QLineEdit,
@@ -61,6 +61,7 @@ if not TYPE_CHECKING:
         QApplication,
         QCompleter,
         QGraphicsOpacityEffect,
+        QInputDialog,
         QMenu,
         QSlider,
         QLineEdit,
@@ -101,6 +102,10 @@ def set_visibility(widget: ui.QWidget, visibility: bool) -> None:
     :param visibility: The visibility of the widget.
     """
     if visibility:
+        widget.setMinimumHeight(0)
+        widget.setMaximumHeight(16777215)
+        widget.updateGeometry()
+        widget.adjustSize()
         widget.setFixedHeight(widget.sizeHint().height())
         widget.setEnabled(True)
     else:
@@ -150,6 +155,68 @@ def add_action(
         action.triggered.connect(receiver)
     parent.addAction(action)
     return action
+
+
+def _event_global_x(event) -> float:
+    try:
+        return event.globalPosition().x()
+    except AttributeError:
+        return float(event.globalPos().x())
+
+
+class ColumnSplitterHandle(ui.QWidget):
+    """Draggable handle between the label and value cells of a variable row.
+
+    Drag updates the global LabelColumnStretch ratio and emits
+    column_width_change through the event bus so every row re-stretches
+    in sync.
+    """
+
+    HANDLE_WIDTH = 10
+    MIN_RATIO = 20
+    MAX_RATIO = 70
+
+    def __init__(self, row_widget: ui.QWidget, event_bus: EventBus) -> None:
+        super().__init__()
+        self.row_widget = row_widget
+        self.event_bus = event_bus
+        self.setFixedWidth(self.HANDLE_WIDTH)
+        self.setCursor(ui.Qt.CursorShape.SplitHCursor)
+        self.setToolTip(str(dtr("Vars", "Drag to resize name / value columns")))
+        self._drag_start_x: float | None = None
+        self._drag_start_ratio: int = 0
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == ui.Qt.MouseButton.LeftButton:
+            self._drag_start_x = _event_global_x(event)
+            self._drag_start_ratio = _UI_CACHE.get("LabelColumnStretch", 45)
+            event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_start_x is None:
+            return
+        row_width = max(self.row_widget.width(), 1)
+        delta_px = _event_global_x(event) - self._drag_start_x
+        delta_ratio = int(round((delta_px / row_width) * 100))
+        new_ratio = self._drag_start_ratio + delta_ratio
+        new_ratio = max(self.MIN_RATIO, min(self.MAX_RATIO, new_ratio))
+        if new_ratio != _UI_CACHE.get("LabelColumnStretch", 45):
+            _UI_CACHE["LabelColumnStretch"] = new_ratio
+            self.event_bus.column_width_change.emit(new_ratio)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_start_x = None
+
+    def paintEvent(self, event) -> None:
+        painter = ui.QPainter(self)
+        try:
+            pen = ui.QPen(ui.QColor(128, 128, 128, 70))
+            pen.setWidth(1)
+            painter.setPen(pen)
+            cx = self.width() // 2
+            painter.drawLine(cx, 2, cx, self.height() - 2)
+        finally:
+            painter.end()
 
 
 class VarEditor(QObject):
@@ -215,12 +282,16 @@ class VarEditor(QObject):
                         toolTip=tooltip,
                         cursorPosition=0,
                     )
+                    self.column_handle = ColumnSplitterHandle(box, event_bus)
+                    ui.place_widget(self.column_handle)
                     self.create_input_editor(tooltip)
                     self.create_menu_button()
 
             self.create_description(box)
             self.install_focus_style_listener()
 
+        self.widget.setContextMenuPolicy(ui.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.widget.customContextMenuRequested.connect(self.on_context_menu_requested)
         self.event_bus.column_width_change.connect(self.on_column_width_changed)
 
     def on_column_width_changed(self, value: int) -> None:
@@ -447,7 +518,7 @@ Python: freecad.vars.api.get_var("{var.name}", doc)</pre>
             clicked=self.popup_menu,
         )
 
-    def popup_menu(self) -> None:
+    def _build_popup_menu(self) -> QMenu:
         menu = QMenu()
 
         add_action(
@@ -525,12 +596,23 @@ Python: freecad.vars.api.get_var("{var.name}", doc)</pre>
             receiver=self.cmd_sort_bottom,
             icon="sort-bottom.svg",
         )
+        return menu
 
+    def popup_menu(self) -> None:
+        menu = self._build_popup_menu()
         btn: ui.QToolButton = self.sender()
         try:
             menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
         except AttributeError:
             menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def on_context_menu_requested(self, pos) -> None:
+        menu = self._build_popup_menu()
+        global_pos = self.widget.mapToGlobal(pos)
+        try:
+            menu.exec(global_pos)
+        except AttributeError:
+            menu.exec_(global_pos)
 
     def cmd_sort_top(self) -> None:
         self.variable.reorder(float("-inf"))
@@ -609,7 +691,6 @@ class EventBus(QObject):
     goto_rename_var = ui.Signal(Variable)
     goto_delete_var = ui.Signal(Variable)
     goto_var_references = ui.Signal(Variable)
-    goto_groups = ui.Signal()
 
     variable_changed = ui.Signal(Variable)
 
@@ -620,6 +701,9 @@ class EventBus(QObject):
     var_edited = ui.Signal(Variable)
     var_group_will_change = ui.Signal(Variable)
     var_reordered = ui.Signal(object)
+
+    group_renamed = ui.Signal(str, str)
+    group_order_changed = ui.Signal()
 
     request_focus = ui.Signal(str)
 
@@ -654,25 +738,156 @@ class VarGroupSection(QObject):
         super().__init__(parent)
         self.name = name
         self.event_bus = event_bus
+        self._collapsed = _get_collapsed_groups().get(name, False)
 
-        with ui.GroupBox(
-            title=display_label(name),
-            contentsMargins=(2, 2, 2, 2),
-            objectName=f"VarsGroupBox{hash(name)}",
-            styleSheet=f"QGroupBox[objectName='VarsGroupBox{hash(name)}'] {{margin-bottom: 20;}}",
+        with ui.Container(
+            contentsMargins=(2, 2, 2, 12),
             add=add,
         ) as box:
             self.container = box
             box.groupInstance = self
-            with ui.Col(contentsMargins=(2, 2, 2, 2), spacing=0) as col:
-                self.editors_layout = col.layout()
-                self.editors = [
-                    VarEditor(var, event_bus, parent=self) for var in variables if var.group == name
-                ]
+            with ui.Col(contentsMargins=(0, 0, 0, 0), spacing=0):
+                self.header_button = ui.Button(
+                    text=self._header_text(),
+                    flat=True,
+                    focusPolicy=ui.Qt.FocusPolicy.NoFocus,
+                    styleSheet=(
+                        "QPushButton { text-align: left; padding: 4px 6px; "
+                        "font-weight: bold; border: none; }"
+                        "QPushButton:hover { background-color: rgba(128,128,128,40); }"
+                    ),
+                    clicked=self.toggle_collapsed,
+                )
+                with ui.Container(contentsMargins=(2, 2, 2, 2)) as content:
+                    self.content = content
+                    with ui.Col(contentsMargins=(2, 2, 2, 2), spacing=0) as col:
+                        self.editors_layout = col.layout()
+                        self.editors = [
+                            VarEditor(var, event_bus, parent=self) for var in variables if var.group == name
+                        ]
+
+        if self._collapsed:
+            set_visibility(self.content, False)
+
+        self.header_button.setContextMenuPolicy(ui.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.header_button.customContextMenuRequested.connect(self.on_header_context_menu)
 
         event_bus.var_delete_requested.connect(self.on_delete_requested)
         event_bus.var_reordered.connect(self.on_var_reordered)
         event_bus.var_group_will_change.connect(self.remove_var_editor)
+
+    def _header_text(self) -> str:
+        arrow = "▸" if self._collapsed else "▾"
+        return f"{arrow}  {self.name}"
+
+    def toggle_collapsed(self) -> None:
+        self._collapsed = not self._collapsed
+        self.header_button.setText(self._header_text())
+        set_visibility(self.content, not self._collapsed)
+        self.container.adjustSize()
+        set_visibility(self.container, True)
+        collapsed = _get_collapsed_groups()
+        if self._collapsed:
+            collapsed[self.name] = True
+        else:
+            collapsed.pop(self.name, None)
+
+    def _doc(self) -> Document | None:
+        if self.editors:
+            return self.editors[0].variable.document
+        return App.ActiveDocument
+
+    def _reorder(self, mode: str) -> None:
+        """mode: 'top' | 'up' | 'down' | 'bottom'"""
+        container = VarContainer(self._doc())
+        names = [g.name for g in container.groups()]
+        if self.name not in names:
+            return
+        idx = names.index(self.name)
+        names.pop(idx)
+        if mode == "top":
+            new_idx = 0
+        elif mode == "bottom":
+            new_idx = len(names)
+        elif mode == "up":
+            new_idx = max(0, idx - 1)
+        else:  # down
+            new_idx = min(len(names), idx + 1)
+        names.insert(new_idx, self.name)
+        container.reorder(names)
+        self.event_bus.group_order_changed.emit()
+
+    def _rename(self) -> None:
+        parent = self.header_button.window()
+        new_name, ok = QInputDialog.getText(
+            parent,
+            str(dtr("Vars", "Rename group")),
+            str(dtr("Vars", "New group name:")),
+            text=self.name,
+        )
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == self.name:
+            return
+        group = next(
+            (g for g in VarContainer(self._doc()).groups() if g.name == self.name),
+            None,
+        )
+        if group is None:
+            return
+        old_name = self.name
+        group.rename(new_name)
+        self.event_bus.group_renamed.emit(old_name, group.name)
+
+    def _build_context_menu(self) -> QMenu:
+        menu = QMenu()
+        add_action(
+            menu,
+            text=translate("Vars", "Rename"),
+            receiver=self._rename,
+            icon="rename.svg",
+        )
+        menu.addSeparator()
+        add_action(
+            menu,
+            text=translate("Vars", "Move to top"),
+            receiver=lambda: self._reorder("top"),
+            icon="sort-top.svg",
+        )
+        add_action(
+            menu,
+            text=translate("Vars", "Move up"),
+            receiver=lambda: self._reorder("up"),
+            icon="sort-up.svg",
+        )
+        add_action(
+            menu,
+            text=translate("Vars", "Move down"),
+            receiver=lambda: self._reorder("down"),
+            icon="sort-down.svg",
+        )
+        add_action(
+            menu,
+            text=translate("Vars", "Move to bottom"),
+            receiver=lambda: self._reorder("bottom"),
+            icon="sort-bottom.svg",
+        )
+        return menu
+
+    def on_header_context_menu(self, pos) -> None:
+        menu = self._build_context_menu()
+        global_pos = self.header_button.mapToGlobal(pos)
+        try:
+            menu.exec(global_pos)
+        except AttributeError:
+            menu.exec_(global_pos)
+
+    def apply_rename(self, new_name: str) -> None:
+        self.name = new_name
+        self.header_button.setText(self._header_text())
+        for editor in self.editors:
+            editor.ui_update(editor.variable)
 
     def on_var_reordered(self, editor: VarEditor | None) -> None:
         if editor is None or editor in self.editors:
@@ -702,6 +917,8 @@ class VarGroupSection(QObject):
             editor.filter(text, show_hidden)
             visible = visible or is_visible(editor.widget)
         set_visibility(self.container, visible)
+        if text and visible and self._collapsed:
+            self.toggle_collapsed()
 
     def add_variable_editor(self, var: Variable) -> None:
         if var.group == self.name:
@@ -779,7 +996,6 @@ class HomePage(UIPage):
     recompute_btn: ui.QAbstractButton
     search: ui.InputTextWidget
     show_hidden: bool
-    column_slider: QSlider
 
     def __init__(
         self,
@@ -793,7 +1009,6 @@ class HomePage(UIPage):
         with ui.Col():
             self.create_toolbar()
             editor.search = self.create_search_box()
-            self.create_column_slider()
             with (
                 ui.Scroll(widgetResizable=True) as scroll,
                 ui.Container(),
@@ -812,30 +1027,6 @@ class HomePage(UIPage):
 
         self.event_bus.variable_changed.connect(self.recompute)
         self.event_bus.reload_vars.connect(self.reload_content)
-
-    def create_column_slider(self) -> None:
-        with ui.Row(contentsMargins=(10, 0, 40, 0)):
-            slider = QSlider()
-            slider.setMinimum(0)
-            slider.setMaximum(100)
-            slider.setValue(_UI_CACHE.get("LabelColumnStretch", 45))
-            slider.setOrientation(ui.Qt.Orientation.Horizontal)
-            slider.setTickPosition(QSlider.TickPosition.NoTicks)
-            slider.setFocusPolicy(ui.Qt.FocusPolicy.NoFocus)
-            ui.place_widget(slider)
-            slider.valueChanged.connect(self.on_column_width_change)
-            self.column_slider = slider
-
-    def on_column_width_change(self, value: int) -> None:
-        MIN, MAX = 20, 70
-        if value < MIN:
-            value = MIN
-            self.column_slider.setValue(value)
-        elif value > MAX:
-            value = MAX
-            self.column_slider.setValue(value)
-        _UI_CACHE["LabelColumnStretch"] = value
-        self.event_bus.column_width_change.emit(value)
 
     def recompute(self, var: Variable) -> None:
         if self.auto_recompute:
@@ -894,11 +1085,6 @@ class HomePage(UIPage):
                 icon="table.svg",
                 tooltip=str(dtr("Vars", "Generate report table")),
                 callback=editor.cmd_report,
-            )
-            toolbar_button(
-                icon="groups.svg",
-                tooltip=str(dtr("Vars", "Manage groups")),
-                callback=editor.cmd_manage_groups,
             )
             toolbar_button(
                 icon="preferences-settings.svg",
@@ -1432,184 +1618,6 @@ class ReferencesTable:
                     yield [f"{obj.Label}", prop, expr, obj.Name]
 
 
-class GroupItem(ui.QFrame):
-    """
-    Group editor row.
-    """
-
-    order_changed = ui.Signal()
-    name_changed = ui.Signal()
-
-    group: VarGroup
-    rename_input: ui.QLineEdit
-
-    def __init__(self, group: VarGroup, parent: ui.QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.group = group
-
-        self.rename_input = ui.QLineEdit(self)
-        self.rename_input.setText(self.group.name)
-
-        self.menu = ui.QToolButton(self)
-        self.menu.setText("...")
-        self.menu.setPopupMode(ui.QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.menu.setArrowType(ui.Qt.ArrowType.NoArrow)
-        self.menu.setToolButtonStyle(ui.Qt.ToolButtonStyle.ToolButtonTextOnly)
-        self.menu.setStyleSheet("QToolButton::menu-indicator { image: none; }")
-        self.menu.setFocusPolicy(ui.Qt.FocusPolicy.NoFocus)
-
-        hidden_btn = ui.QToolButton(self)
-        hidden_btn.setIcon(
-            FlatIcon(
-                resources.icon("hidden_ind.svg" if group.hidden else "visible.svg"),
-            ),
-        )
-        hidden_btn.setToolButtonStyle(ui.Qt.ToolButtonStyle.ToolButtonIconOnly)
-        hidden_btn.setToolTip(translate("Vars", "Toggle visibility"))
-        hidden_btn.setFocusPolicy(ui.Qt.FocusPolicy.NoFocus)
-        hidden_btn.clicked.connect(self.on_toggle_visibility)
-
-        add_action(
-            self.menu,
-            text=translate("Vars", "Move to top"),
-            icon="sort-top.svg",
-            receiver=lambda: self.reordered(float("-inf")),
-        )
-
-        add_action(
-            self.menu,
-            text=translate("Vars", "Move up"),
-            icon="sort-up.svg",
-            receiver=lambda: self.reordered(-1.5),
-        )
-
-        add_action(
-            self.menu,
-            text=translate("Vars", "Move down"),
-            icon="sort-down.svg",
-            receiver=lambda: self.reordered(1.5),
-        )
-
-        add_action(
-            self.menu,
-            text=translate("Vars", "Move to bottom"),
-            icon="sort-bottom.svg",
-            receiver=lambda: self.reordered(float("inf")),
-        )
-
-        layout = ui.QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        layout.addWidget(self.rename_input, 1)
-        layout.addWidget(hidden_btn)
-        layout.addWidget(self.menu)
-        self.setLayout(layout)
-
-    def on_toggle_visibility(self) -> None:
-        group = self.group
-        group.hidden = not group.hidden
-        self.sender().setIcon(
-            FlatIcon(
-                resources.icon("hidden_ind.svg" if group.hidden else "visible.svg"),
-            ),
-        )
-
-    def reordered(self, delta: float) -> None:
-        self.group.sort_key = self.group.sort_key + delta
-        self.order_changed.emit()
-
-    def __lt__(self, other: GroupItem) -> bool:
-        return self.group < other.group
-
-    def apply_changes(self) -> None:
-        new_name = self.rename_input.text().strip()
-        if new_name != self.group.name:
-            self.group.rename(new_name)
-            self.name_changed.emit()
-
-
-class GroupManagementPage(UIPage):
-    """View: Reorder/Rename groups."""
-
-    container: VarContainer
-    editors_layout: ui.QVBoxLayout
-    editors: list[GroupItem]
-    root: ui.QWidget
-
-    def __init__(
-        self,
-        editor: VariablesEditor,
-        parent: QObject | None = None,
-    ) -> None:
-        super().__init__(editor, parent)
-        self.container = VarContainer()
-
-        with ui.Col():
-            with ToolBar():
-                toolbar_button(
-                    icon="arrow-back.svg",
-                    tooltip=str(dtr("Vars", "Cancel")),
-                    callback=self.on_cancel,
-                )
-                toolbar_button(
-                    icon="check-mark.svg",
-                    tooltip=str(dtr("Vars", "Apply changes")),
-                    callback=self.on_apply,
-                )
-
-            with ui.GroupBox(title=str(dtr("Vars", "Manage groups"))) as root:
-                self.root = root
-                with (
-                    ui.Scroll(widgetResizable=True),
-                    ui.Container(),
-                    ui.Col(contentsMargins=(0, 0, 0, 0), spacing=0),
-                ):
-                    with ui.Col(contentsMargins=(0, 0, 0, 0), spacing=0) as col:
-                        self.editors_layout = col.layout()
-                    self.editors = []
-                    ui.Stretch(1)
-
-    def load_groups(self) -> None:
-        layout = self.editors_layout
-        for ed in self.editors:
-            ed.deleteLater()
-        editors = self.editors = []
-        root = self.root
-        for i in range(layout.count()):
-            layout.takeAt(i)
-
-        for g in self.container.groups():
-            row = GroupItem(g, root)
-            row.order_changed.connect(self.on_reordered)
-            editors.append(row)
-            layout.addWidget(row)
-
-    def on_cancel(self) -> None:
-        self.event_bus.goto_home.emit()
-
-    def on_apply(self) -> None:
-        names = []
-        hidden = []
-        for ge in self.editors:
-            ge.apply_changes()
-            names.append(ge.group.name)
-            if ge.group.hidden:
-                hidden.append(ge.group.name)
-        self.container.reorder(names)
-        self.container.set_hidden(hidden)
-        self.event_bus.reload_vars.emit()
-
-    def on_reordered(self) -> None:
-        self.editors.sort()
-        for index, ge in enumerate(self.editors):
-            ge.group.sort_key = index
-
-        layout = self.editors_layout
-        for ge in self.editors:
-            layout.removeWidget(ge)
-            layout.addWidget(ge)
-
-
 class VarRenamePage(UIPage):
     """View: Rename variable form page."""
 
@@ -1788,7 +1796,6 @@ class VariablesEditor(QObject):
     references_page: VarReferencesPage
     delete_page: VarDeletePage
     home_page: HomePage
-    groups_page: GroupManagementPage
 
     q_settings = QSettings("FreeCAD", "mnesarco-Vars")
 
@@ -1819,7 +1826,6 @@ class VariablesEditor(QObject):
                 self.rename_page = VarRenamePage(self, dialog)
                 self.references_page = VarReferencesPage(self, dialog)
                 self.delete_page = VarDeletePage(self, dialog)
-                self.groups_page = GroupManagementPage(self, dialog)
 
         if x or y:
             dialog.setGeometry(x, y, w, h)
@@ -1899,15 +1905,31 @@ class VariablesEditor(QObject):
         bus.goto_home.connect(self.on_home)
         bus.goto_var_references.connect(self.cmd_var_references)
         bus.goto_delete_var.connect(self.cmd_delete_var)
-        bus.goto_groups.connect(self.cmd_manage_groups)
         bus.var_created.connect(self.on_var_created)
         bus.var_edited.connect(self.on_var_edited)
         bus.var_editor_removed.connect(self.do_delete_var)
         bus.filter_changed.connect(self.cmd_filter)
+        bus.group_renamed.connect(self.on_group_renamed)
+        bus.group_order_changed.connect(self.on_group_order_changed)
 
-    def cmd_manage_groups(self) -> None:
-        self.groups_page.load_groups()
-        self.switch_to_page(self.groups_page)
+    def on_group_renamed(self, old_name: str, new_name: str) -> None:
+        sections = getattr(self, "sections", None) or []
+        for section in sections:
+            if section.name == old_name:
+                section.apply_rename(new_name)
+                break
+
+    def on_group_order_changed(self) -> None:
+        sections = getattr(self, "sections", None) or []
+        layout = getattr(self, "sections_layout", None)
+        if not layout or not sections:
+            return
+        order = {g.name: i for i, g in enumerate(VarContainer(self.doc).groups())}
+        sections.sort(key=lambda s: order.get(s.name, float("inf")))
+        for section in sections:
+            layout.removeWidget(section.container)
+            layout.addWidget(section.container)
+        layout.activate()
 
     def do_delete_var(self, var: Variable) -> None:
         var.delete()
@@ -2170,6 +2192,15 @@ class SelectAllEventFilter(QObject):
             widget.installEventFilter(self)
 
 
-_UI_CACHE = {
+_UI_CACHE: dict = {
     "LabelColumnStretch": 45,
+    "CollapsedGroups": {},
 }
+
+
+def _get_collapsed_groups() -> dict:
+    collapsed = _UI_CACHE.setdefault("CollapsedGroups", {})
+    if not isinstance(collapsed, dict):
+        collapsed = {}
+        _UI_CACHE["CollapsedGroups"] = collapsed
+    return collapsed

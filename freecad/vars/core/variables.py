@@ -1022,9 +1022,16 @@ class VarGroup:
 
     def rename(self, new_name: str) -> None:
         new_name = new_name.strip()
-        for var in get_vars():
+        for var in get_vars(self.doc):
             if var.group == self.name:
                 var.group = new_name
+        container = VarContainer(self.doc)
+        for prop in ("Sort", "Hidden"):
+            raw = getattr(container.obj, prop, "") or ""
+            names = raw.split("\n") if raw else []
+            if self.name in names:
+                names[names.index(self.name)] = new_name
+                setattr(container.obj, prop, "\n".join(names))
         self.name = new_name
 
     def variables(self) -> list[Variable]:
