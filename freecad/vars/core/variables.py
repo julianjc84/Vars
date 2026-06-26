@@ -56,6 +56,8 @@ def create_var(
     expression: str | None = None,
     group: str = "Default",
     doc: Document | None = None,
+    min_limit: str | None = None,
+    max_limit: str | None = None,
 ) -> bool:
     """
     Create a variable in a document.
@@ -69,6 +71,8 @@ def create_var(
     :param expression: The expression to calculate the value of the variable, defaults to None.
     :param group: The group where to create the variable, defaults to "Default".
     :param doc: The document where to create the variable, defaults to the active document.
+    :param min_limit: The minimum value for the variable.
+    :param max_limit: The maximum value for the variable.
     :return: True if the variable was created, False otherwise.
     """
     name = sanitize_var_name(name)
@@ -132,11 +136,29 @@ def create_var(
     )
     varset.Hidden = False
 
+    # Create RawValue, MinLimit and MaxLimit properties upfront for expression support
+    varset.addProperty(var_type, "RawValue", "", "Raw Value")
+    varset.addProperty(var_type, "MinLimit", "", "Minimum Limit Value")
+    varset.addProperty(var_type, "MaxLimit", "", "Maximum Limit Value")
+    
+    # Add constraint state tracking
+    varset.addProperty(
+        "App::PropertyBool",
+        "IsConstrained", 
+        "",
+        "Variable has min/max constraints",
+        PropertyMode.Output | PropertyMode.NoRecompute | PropertyMode.Hidden,
+    )
+    varset.IsConstrained = False
+
     if expression:
         varset.setExpression("Value", expression, "Calculated")
         varset.recompute()
     elif value is not None:
         varset.Value = value
+
+    if min_limit or max_limit:
+        Variable(doc, name).apply_min_max_limits(min_limit, max_limit)
 
     if preferences.hide_varsets():
         varset.ViewObject.ShowInTree = False
@@ -629,27 +651,35 @@ class Variable:
         self._obj = get_varset(self._name, self._doc)
         return self
 
+    def get_editable_property_name(self) -> str:
+        return "RawValue" if self.is_constrained else "Value"
+
+    @property
+    def is_constrained(self) -> bool:
+        return getattr(self.varset, "IsConstrained", False)
+
     @property
     def name(self) -> str:
         return self._name
 
     @property
     def value(self) -> Any:
-        return self.varset.Value
+        return getattr(self.varset, self.get_editable_property_name())
 
     @value.setter
     def value(self, value: Any) -> None:
         varset = self.varset
-        attr = varset.Value
+        prop = self.get_editable_property_name()
+        attr = getattr(varset, prop)
         if isinstance(attr, App.Units.Quantity):
             if isinstance(value, str):
-                varset.Value = App.Units.Quantity(value)
+                setattr(varset, prop, App.Units.Quantity(value))
             elif isinstance(value, tuple):
-                varset.Value = App.Units.Quantity(*value)
+                setattr(varset, prop, App.Units.Quantity(*value))
             else:
-                varset.Value = value
+                setattr(varset, prop, value)
         else:
-            varset.Value = value
+            setattr(varset, prop, value)
 
     def rename(self, new_name: str, description: str | None = None) -> bool:
         varset = self.varset
@@ -686,17 +716,20 @@ class Variable:
 
     @property
     def expression(self) -> str | None:
+        prop = self.get_editable_property_name()
         if (varset := self.varset) and varset.ExpressionEngine:
-            for prop, expr, *_ in varset.ExpressionEngine:
-                if prop == "Value":
+            for p, expr, *_ in varset.ExpressionEngine:
+                if p == prop:
                     return expr
         return None
 
     @expression.setter
     def expression(self, expression: str | None) -> None:
+        prop = self.get_editable_property_name()
         if not expression:
-            self.varset.clearExpression("Value")
-        self.varset.setExpression("Value", expression)
+            self.varset.clearExpression(prop)
+        else:
+            self.varset.setExpression(prop, expression)
 
     def __repr__(self) -> str:
         return f"Variable(name={self.name}, value={self.value})"
@@ -884,6 +917,95 @@ class Variable:
             doc=self._doc,
             converter=converter,
         )
+
+    def ensure_constraint_properties(self) -> None:
+        """
+        Ensure all constraint-related properties exist for backward compatibility.
+        Adds missing properties to variables created before constraint system was added.
+        """
+        varset = self.varset
+        var_type = self.var_type
+        
+        # Add RawValue property if missing
+        if not hasattr(varset, "RawValue"):
+            varset.addProperty(var_type, "RawValue", "", "Raw Value")
+            # Initialize with current Value
+            if hasattr(varset, "Value"):
+                varset.RawValue = varset.Value
+                
+        # Add MinLimit property if missing  
+        if not hasattr(varset, "MinLimit"):
+            varset.addProperty(var_type, "MinLimit", "", "Minimum Limit Value")
+            
+        # Add MaxLimit property if missing
+        if not hasattr(varset, "MaxLimit"):
+            varset.addProperty(var_type, "MaxLimit", "", "Maximum Limit Value")
+            
+        # Add IsConstrained property if missing
+        if not hasattr(varset, "IsConstrained"):
+            varset.addProperty(
+                "App::PropertyBool",
+                "IsConstrained", 
+                "",
+                "Variable has min/max constraints",
+                PropertyMode.Output | PropertyMode.NoRecompute | PropertyMode.Hidden,
+            )
+            varset.IsConstrained = False
+
+    def apply_min_max_limits(self, min_limit: str | None, max_limit: str | None) -> None:
+        """
+        Apply min/max limits to the variable by setting an expression on its Value property.
+        This creates a RawValue property to hold the unclamped value.
+        """
+        # Ensure all constraint properties exist (backward compatibility)
+        self.ensure_constraint_properties()
+        
+        varset = self.varset
+        has_min = min_limit and min_limit.strip()
+        has_max = max_limit and max_limit.strip()
+
+        if not has_min and not has_max:
+            # Clear expression and restore Value from RawValue
+            varset.clearExpression("Value")
+            varset.Value = varset.RawValue
+            # Clear constraint flag
+            varset.IsConstrained = False
+            return
+
+        # RawValue now always exists, ensure it has the current Value if no expression
+        value_has_expression = False
+        if varset.ExpressionEngine:
+            for prop, _, *_ in varset.ExpressionEngine:
+                if prop == "Value":
+                    value_has_expression = True
+                    break
+        if not value_has_expression:
+            varset.RawValue = varset.Value
+
+        expression_val = "RawValue"
+        if has_min:
+            # Use setExpression to parse string and handle units
+            varset.setExpression("MinLimit", min_limit)
+            varset.recompute()
+            varset.clearExpression("MinLimit")
+            expression_val = f"max(MinLimit, {expression_val})"
+
+        if has_max:
+            varset.setExpression("MaxLimit", max_limit)
+            varset.recompute()
+            varset.clearExpression("MaxLimit")
+            expression_val = f"min({expression_val}, MaxLimit)"
+
+        if has_min and has_max and varset.MinLimit > varset.MaxLimit:
+            msg = (
+                f"apply_min_max_limits: min_limit ({min_limit}) "
+                f"must be <= max_limit ({max_limit})"
+            )
+            raise ValueError(msg)
+
+        varset.setExpression("Value", expression_val)
+        # Set constraint flag
+        varset.IsConstrained = True
 
 
 @dataclass

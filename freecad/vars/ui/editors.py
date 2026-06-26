@@ -37,6 +37,7 @@ from freecad.vars.vendor.fcapi.lang import dtr, translate
 
 from . import widgets as uix
 from .style import TEXT_COLOR, FlatIcon, interpolate_style_vars
+import FreeCADGui as Gui  # type: ignore
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
         QGraphicsOpacityEffect,
         QMenu,
         QSlider,
+        QLineEdit,
     )
 
 if not TYPE_CHECKING:
@@ -61,6 +63,7 @@ if not TYPE_CHECKING:
         QGraphicsOpacityEffect,
         QMenu,
         QSlider,
+        QLineEdit,
     )
 
 style_vars = {
@@ -86,7 +89,6 @@ stylesheet = interpolate_style_vars(
     """,
     style_vars,
 )
-
 
 def set_visibility(widget: ui.QWidget, visibility: bool) -> None:
     """
@@ -134,7 +136,7 @@ def add_action(
     :param text: The text to set for the action. Defaults to an empty string.
     :param icon: The icon name to set for the action. Defaults to None.
     :param tooltip: The tooltip to set for the action. Defaults to None.
-    :param shortcut: The shortcut to set for the action. Defaults to None.
+    :param shortcut: The shortcut to set for the action. Defaults to None:
     :param receiver: The function to connect to the action's triggered signal. Defaults to None.
     """
     action = ui.QAction(str(text), parent)
@@ -162,6 +164,7 @@ class VarEditor(QObject):
     lock_event_filter: LockEventFilter
     lock_action: ui.QAction
     scroll_event_filter: ScrollEventFilter
+    select_all_event_filter: SelectAllEventFilter
     row_layout: ui.QHBoxLayout
 
     def __init__(
@@ -188,6 +191,7 @@ class VarEditor(QObject):
         self.lock_event_filter = LockEventFilter(self)
         self.lock_action = None
         self.scroll_event_filter = ScrollEventFilter(self)
+        self.select_all_event_filter = SelectAllEventFilter(self)
 
         with ui.Container(
             contentsMargins=(0, 0, 0, 0),
@@ -259,10 +263,12 @@ class VarEditor(QObject):
         accessor_adapter.validation_failed.connect(self.on_validation_failed)
         accessor_adapter.property_assigned.connect(self.on_property_assigned)
 
+        prop_name = variable.get_editable_property_name()
+
         if variable.var_type == "App::PropertyEnumeration":
             self.editor = uix.PropertyEnumerationWidget(
                 obj=variable.varset,
-                prop_name="Value",
+                prop_name=prop_name,
                 accessor_adapter=accessor_adapter,
                 objectName=f"VarEditor_{variable.internal_name}",
                 stretch=100 - _UI_CACHE.get("LabelColumnStretch", 45),
@@ -270,7 +276,7 @@ class VarEditor(QObject):
         else:
             self.editor = ui.InputQuantity(
                 obj=variable.varset,
-                property="Value",
+                property=prop_name,
                 auto_apply=True,
                 stretch=100 - _UI_CACHE.get("LabelColumnStretch", 45),
                 widget_type=widget_type,
@@ -284,15 +290,71 @@ class VarEditor(QObject):
         self.editor.valueChanged.connect(
             lambda _: self.event_bus.variable_changed.emit(variable),
         )
+        self.editor.valueChanged.connect(self.update_constraint_ui)
 
         self.event_bus.variable_changed.connect(self.silent_value_update)
         self.event_bus.var_renamed.connect(self.ui_update)
 
         self.lock_ui(variable.read_only)
         self.update_visibility_ui()
+        self.update_constraint_ui()
         self.scroll_event_filter.install(self.editor)
+        self.select_all_event_filter.install(self.editor)
 
         return self.editor
+
+    def update_constraint_ui(self) -> None:
+        if not self.variable.is_constrained:
+            if hasattr(self.label, "_constraint_icon"):
+                self.label.removeAction(self.label._constraint_icon)
+                del self.label._constraint_icon
+            if hasattr(self.label, "_constraint_warning_icon"):
+                self.label.removeAction(self.label._constraint_warning_icon)
+                del self.label._constraint_warning_icon
+            return
+
+        # Determine error state
+        is_error = False
+        val = self.variable.value
+        min_val = getattr(self.variable.varset, "MinLimit", None)
+        max_val = getattr(self.variable.varset, "MaxLimit", None)
+        tooltip = str(dtr("Vars", "Value is constrained"))
+
+        if min_val is not None and val < min_val:
+            is_error = True
+            tooltip = str(dtr("Vars", "Value is below minimum limit"))
+        elif max_val is not None and val > max_val:
+            is_error = True
+            tooltip = str(dtr("Vars", "Value is above maximum limit"))
+
+        # Constraint icon
+        ref_icon_resource = resources.icon("reference.svg")
+        if is_error:
+            icon = ui.ColorIcon(ref_icon_resource, ui.Color("red"))
+        else:
+            icon = FlatIcon(ref_icon_resource)
+
+        if hasattr(self.label, "_constraint_icon"):
+            action = self.label._constraint_icon
+            action.setIcon(icon)
+            action.setToolTip(tooltip)
+        else:
+            action = ui.QAction(icon=icon, toolTip=tooltip)
+            self.label.addAction(action, ui.QLineEdit.ActionPosition.TrailingPosition)
+            self.label._constraint_icon = action
+
+        # Warning icon for out of bounds
+        if is_error:
+            if not hasattr(self.label, "_constraint_warning_icon"):
+                warning_icon = ui.ColorIcon(resources.icon("warning.svg"), ui.Color("red"))
+                warning_action = ui.QAction(icon=warning_icon, toolTip=tooltip)
+                self.label.addAction(warning_action, ui.QLineEdit.ActionPosition.TrailingPosition)
+                self.label._constraint_warning_icon = warning_action
+            else:
+                self.label._constraint_warning_icon.setToolTip(tooltip)
+        elif hasattr(self.label, "_constraint_warning_icon"):
+            self.label.removeAction(self.label._constraint_warning_icon)
+            del self.label._constraint_warning_icon
 
     def lock_ui(self, lock: bool = True) -> None:
         if lock:
@@ -344,6 +406,7 @@ class VarEditor(QObject):
             self.label.setToolTip(self.var_tooltip())
             self.description.setText(var.description)
             self.update_visibility_ui()
+            self.update_constraint_ui()
             self.silent_value_update(var)
 
     def silent_value_update(self, var: Variable) -> None:
@@ -354,12 +417,23 @@ class VarEditor(QObject):
 
     def var_tooltip(self) -> str:
         var = self.variable
-        return dedent(f"""
-            <p>{var.name}: {shorten(var.description, 255, placeholder="...")}</p>
-            <pre>Type: {var.var_type}
-            Reference: &lt;&lt;{var.name}&gt;&gt;.Value
-            Python: freecad.vars.api.get_var("{var.name}", doc)</pre>
-            """)
+        if var.is_constrained:
+            tooltip = f"""
+                <p>{var.name}: {shorten(var.description, 255, placeholder="...")}</p>
+                <pre>Type: {var.var_type}
+Min Limit: {var.varset.MinLimit}
+Max Limit: {var.varset.MaxLimit}
+Reference: &lt;&lt;{var.name}&gt;&gt;.Value
+Python: freecad.vars.api.get_var("{var.name}", doc)</pre>
+"""
+        else:
+            tooltip = f"""
+                <p>{var.name}: {shorten(var.description, 255, placeholder="...")}</p>
+                <pre>Type: {var.var_type}
+Reference: &lt;&lt;{var.name}&gt;&gt;.Value
+Python: freecad.vars.api.get_var("{var.name}", doc)</pre>
+"""
+        return dedent(tooltip)
 
     def create_menu_button(self) -> None:
         ui.Button(
@@ -826,6 +900,11 @@ class HomePage(UIPage):
                 tooltip=str(dtr("Vars", "Manage groups")),
                 callback=editor.cmd_manage_groups,
             )
+            toolbar_button(
+                icon="preferences-settings.svg",
+                tooltip=str(dtr("Vars", "Open Preferences")),
+                callback=lambda: Gui.runCommand("Std_DlgPreferences", 0),
+            )
             self.toggle_hidden_btn()
             ui.Stretch(1)
 
@@ -934,6 +1013,7 @@ class VarEditPage(UIPage):
     """View: Edit variable form page."""
 
     var: Variable | None = None
+    editing_mode: bool = False  # Track ADD vs EDIT mode for conditional field creation
     description: ui.InputTextMultilineWidget
     name: ui.InputTextWidget
     types: ui.InputOptionsWidget
@@ -942,6 +1022,11 @@ class VarEditPage(UIPage):
     messages: ui.QLabel
     references: ReferencesTable
     options: ui.InputTextMultilineWidget
+    constrain_checkbox: ui.QCheckBox
+    constrain_group: ui.QWidget
+    min_limit: ui.InputTextWidget
+    max_limit: ui.InputTextWidget
+    select_all_event_filter: SelectAllEventFilter
 
     def __init__(
         self,
@@ -949,6 +1034,7 @@ class VarEditPage(UIPage):
         parent: QObject | None = None,
     ) -> None:
         super().__init__(editor, parent)
+        self.select_all_event_filter = SelectAllEventFilter(self)
         with ui.Col():
             with ToolBar():
                 toolbar_button(
@@ -1004,6 +1090,27 @@ class VarEditPage(UIPage):
                         stretch=1,
                     )
 
+                    # Warning text about real-time constraint field updates
+                    self.constraint_warning = ui.TextLabel(
+                        str(dtr("Vars", "Note: Constraint fields are directly bound to variable properties. Changes are applied in real-time and cannot be undone with the back button.")),
+                        wordWrap=True,
+                        styleSheet="color: #666; font-size: 11px; font-style: italic; padding: 8px 0px 4px 0px;",
+                    )
+
+                    self.constrain_checkbox = ui.InputBoolean(
+                        label=str(dtr("Vars", "Constrain Value"))
+                    )
+                    # Create constraint group container
+                    with ui.Col() as self.constrain_group:
+                        # Constraint fields will be created by _create_constraint_fields()
+                        pass
+                    
+                    # Create constraint fields based on mode
+                    self._create_constraint_fields()
+                    
+                    self.constrain_checkbox.toggled.connect(self._on_constrain_toggled)
+                    self.constrain_group.hide()
+
                     with ui.Col(contentsMargins=(0, 0, 0, 0)):
                         ui.TextLabel(str(dtr("Vars", "Options:")))
                         self.options = ui.InputTextMultiline(
@@ -1028,8 +1135,134 @@ class VarEditPage(UIPage):
                     ui.Stretch(1)
             self.messages = ui.TextLabel(visible=False, wordWrap=True)
 
+    def _create_constraint_fields(self) -> None:
+        """Create Min/Max constraint fields based on current mode."""
+        layout = self.constrain_group.layout()
+        
+        # Clear existing fields if any - properly remove event filters first
+        while layout.count():
+            child = layout.takeAt(0)
+            if child.widget():
+                widget = child.widget()
+                # Remove event filters before deleting to prevent accessing deleted objects
+                if hasattr(self, 'select_all_event_filter'):
+                    try:
+                        # Remove event filter from widget and its child widgets
+                        widget.removeEventFilter(self.select_all_event_filter)
+                        for child_widget in widget.findChildren(ui.QWidget):
+                            child_widget.removeEventFilter(self.select_all_event_filter)
+                    except (AttributeError, RuntimeError):
+                        pass  # Widget may already be deleted
+                widget.deleteLater()
+        
+        # Create widgets manually without UI context stack
+        from freecad.vars.vendor.fcapi.lang import dtr
+        
+        # Create Min Limit label
+        min_label = ui.QLabel(str(dtr("Vars", "Min Limit:")))
+        layout.addWidget(min_label)
+        
+        # Create Min Limit field with property binding in EDIT mode for FX buttons
+        if self.editing_mode and self.var and self.var.exists():
+            # Use same widget_type logic as working Value field
+            if prop_info := PROPERTY_INFO.get(self.var.var_type):
+                widget_type = prop_info.editor
+            else:
+                widget_type = "Gui::ExpLineEdit"
+            
+            # Create accessor adapter for property handling
+            from freecad.vars.core.properties import PropertyAccessorAdapter
+            min_accessor_adapter = PropertyAccessorAdapter(self.var.var_type)
+            # Note: validation_failed/property_assigned signals not connected in VarEditPage
+            # (these methods exist only in VarEditor for validation UI feedback)
+            
+            # Ensure MinLimit property exists and has a reasonable initial value
+            varset = self.var.varset
+            
+            # EDIT mode: Property-bound field with FX button
+            self.min_limit = ui.InputQuantity(
+                obj=self.var.varset,
+                property="MinLimit",
+                auto_apply=True,
+                stretch=100 - _UI_CACHE.get("LabelColumnStretch", 45),
+                widget_type=widget_type,
+                name=f"MinLimit_{self.var.internal_name}",
+                toolTip=str(dtr("Vars", "Expression or value (e.g., 2*pi, <<OtherVar>>.Value, 10mm)")),
+                accessor_adapter=min_accessor_adapter,
+                add=False  # Required when creating widgets manually outside UI context
+            )
+        else:
+            # ADD mode: Regular form-style field (no FX button needed)
+            self.min_limit = ui.InputQuantity(
+                widget_type="Gui::ExpLineEdit",
+                toolTip=str(dtr("Vars", "Expression or value (e.g., 2*pi, <<OtherVar>>.Value, 10mm)")),
+                add=False  # Don't auto-add to context stack
+            )
+        
+        layout.addWidget(self.min_limit)
+        self.select_all_event_filter.install(self.min_limit)
+        
+        # Create Max Limit label
+        max_label = ui.QLabel(str(dtr("Vars", "Max Limit:")))
+        layout.addWidget(max_label)
+        
+        # Create Max Limit field with property binding in EDIT mode for FX buttons
+        if self.editing_mode and self.var and self.var.exists():
+            # Create accessor adapter for property handling
+            max_accessor_adapter = PropertyAccessorAdapter(self.var.var_type)
+            # Note: validation_failed/property_assigned signals not connected in VarEditPage
+            # (these methods exist only in VarEditor for validation UI feedback)
+            
+            # Ensure MaxLimit property exists and has a reasonable initial value
+            
+            # EDIT mode: Property-bound field with FX button
+            self.max_limit = ui.InputQuantity(
+                obj=self.var.varset,
+                property="MaxLimit",
+                auto_apply=True,
+                stretch=100 - _UI_CACHE.get("LabelColumnStretch", 45),
+                widget_type=widget_type,
+                name=f"MaxLimit_{self.var.internal_name}",
+                toolTip=str(dtr("Vars", "Expression or value (e.g., 2*pi, <<OtherVar>>.Value, 100mm)")),
+                accessor_adapter=max_accessor_adapter,
+                add=False  # Required when creating widgets manually outside UI context
+            )
+        else:
+            # ADD mode: Regular form-style field (no FX button needed)
+            self.max_limit = ui.InputQuantity(
+                widget_type="Gui::ExpLineEdit",
+                toolTip=str(dtr("Vars", "Expression or value (e.g., 2*pi, <<OtherVar>>.Value, 100mm)")),
+                add=False  # Don't auto-add to context stack
+            )
+        
+        layout.addWidget(self.max_limit)
+        self.select_all_event_filter.install(self.max_limit)
+        
+        # Property-bound fields handle value loading automatically via InputPropertyWrapper
+        # No manual setValue() needed - the wrapper does this automatically
+
+    def _load_constraint_values(self) -> None:
+        """
+        DEPRECATED: Load existing Min/Max values/expressions into constraint fields.
+        
+        This method is no longer used. Property-bound fields automatically load 
+        values via the InputPropertyWrapper.
+        """
+        # This method is deprecated and should not be called for property-bound fields
+        pass
+
+    def _on_constrain_toggled(self, checked: bool) -> None:
+        """Handle constraint checkbox toggle."""
+        self.constrain_group.setVisible(checked)
+        
+        # If we're editing an existing variable and unchecking constraints, clear them immediately
+        if not checked and self.var and self.var.exists():
+            self.var.apply_min_max_limits(None, None)  # Clear constraints
+
+
     def init_new(self) -> None:
         self.var = None
+        self.editing_mode = False  # Set ADD mode
         self.root.setTitle(str(dtr("Vars", "Create new variable")))
         self.name.setText("")
         self.name.setEnabled(True)
@@ -1040,9 +1273,25 @@ class VarEditPage(UIPage):
         self.groups.setOptions({v: v for v in get_groups()})
         self.options.setText("")
         self.references.table.parent().hide()
+        
+        # Hide constraint fields entirely in ADD mode (advanced feature for editing only)
+        # Hide the parent container that holds both the checkbox and "Constrain Value" label
+        if self.constrain_checkbox.parent():
+            self.constrain_checkbox.parent().hide()
+        else:
+            self.constrain_checkbox.hide()
+        self.constrain_group.hide()
+        # Hide constraint warning text in ADD mode
+        self.constraint_warning.hide()
 
     def init_edit(self, var: Variable) -> None:
         self.var = var
+        self.editing_mode = True  # Set EDIT mode
+        
+        # Ensure constraint properties exist for backward compatibility
+        # This upgrades old variables to support the new constraint system
+        var.ensure_constraint_properties()
+        
         self.root.setTitle(str(dtr("Vars", "Edit variable")))
         self.name.setText(var.name)
         self.name.setEnabled(False)
@@ -1055,6 +1304,26 @@ class VarEditPage(UIPage):
         self.references.update(var)
         self.messages.setText("")
         self.messages.hide()
+        
+        # Show constraint fields in EDIT mode
+        # Show the parent container that holds both the checkbox and "Constrain Value" label
+        if self.constrain_checkbox.parent():
+            self.constrain_checkbox.parent().show()
+        else:
+            self.constrain_checkbox.show()
+        # Show constraint warning text in EDIT mode
+        self.constraint_warning.show()
+        
+        is_constrained = var.is_constrained
+        self.constrain_checkbox.setChecked(is_constrained)
+        self.constrain_group.setVisible(is_constrained)
+        
+        # Recreate constraint fields for EDIT mode (property-bound fields with FX buttons)
+        self._create_constraint_fields()
+        
+        # In EDIT mode with property binding, the fields automatically show current values
+        # No need to manually load values since they're bound to the properties
+
 
     def on_cancel(self) -> None:
         self.event_bus.goto_home.emit()
@@ -1063,6 +1332,20 @@ class VarEditPage(UIPage):
         self.messages.hide()
         var_type = (self.types.currentText() or "").strip()
         var_group = (self.groups.currentText() or "Default").strip()
+        
+        # Get constraint values - only in EDIT mode when constraints are visible
+        min_limit = None
+        max_limit = None
+        if self.editing_mode and self.constrain_checkbox.isVisible() and self.constrain_checkbox.isChecked():
+            # EDIT mode: Get values from property-bound fields or fallback to text
+            try:
+                min_text = self.min_limit.editor.text().strip() if hasattr(self.min_limit, 'editor') else ""
+                max_text = self.max_limit.editor.text().strip() if hasattr(self.max_limit, 'editor') else ""
+                min_limit = min_text if min_text else None
+                max_limit = max_text if max_text else None
+            except (AttributeError, RuntimeError):
+                min_limit = None
+                max_limit = None
 
         if var_type not in PROPERTY_INFO:
             self.messages.setText(
@@ -1083,6 +1366,8 @@ class VarEditPage(UIPage):
                 group=var_group,
                 description=self.description.value().strip(),
                 options=options,
+                min_limit=min_limit,
+                max_limit=max_limit,
             )
         ):
             self.messages.setText(err)
@@ -1096,6 +1381,8 @@ class VarEditPage(UIPage):
                 group=var_group,
                 description=self.description.value().strip(),
                 options=options,
+                min_limit=min_limit,
+                max_limit=max_limit,
             )
         ):
             self.messages.setText(err)
@@ -1715,6 +2002,8 @@ class VariablesEditor(QObject):
         group: str,
         description: str,
         options: list[str] | None,
+        min_limit: str | None,
+        max_limit: str | None,
     ) -> str | None:
         try:
             var = create_var(
@@ -1724,6 +2013,8 @@ class VariablesEditor(QObject):
                 description=description,
                 options=options,
                 doc=self.doc,
+                min_limit=min_limit,
+                max_limit=max_limit,
             )
             if var:
                 self.event_bus.var_created.emit(Variable(self.doc, name))
@@ -1741,12 +2032,19 @@ class VariablesEditor(QObject):
         group: str,
         description: str,
         options: list[str] | None,
+        min_limit: str | None,
+        max_limit: str | None,
     ) -> str | None:
         if description != var.description:
             var.description = description
 
         if var_type != var.var_type and not var.change_var_type(var_type):
             return str(dtr("Vars", "Failed to set variable type."))
+
+        try:
+            var.apply_min_max_limits(min_limit, max_limit)
+        except ValueError as e:
+            return str(e)
 
         if group and (group != var.group):
             var.group = group
@@ -1835,6 +2133,41 @@ class LockEventFilter(QObject):
         target.removeEventFilter(self)
         for child in target.findChildren(ui.QWidget):
             child.removeEventFilter(self)
+
+
+class SelectAllEventFilter(QObject):
+    """
+    Select all text on focus in.
+    """
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.FocusIn:
+            if isinstance(obj, QAbstractSpinBox):
+                if line_edit := obj.lineEdit():
+                    QTimer.singleShot(0, lambda: self.select_numeric_part(line_edit))
+            elif isinstance(obj, QLineEdit):
+                QTimer.singleShot(0, lambda: self.select_numeric_part(obj))
+        return super().eventFilter(obj, event)
+
+    def select_numeric_part(self, line_edit: QLineEdit) -> None:
+        text = line_edit.text()
+        for i, char in enumerate(text):
+            if char.isalpha() or char.isspace():
+                line_edit.setSelection(0, i)
+                return
+        line_edit.selectAll()
+
+    def install(self, target: ui.QWidget) -> None:
+        if isinstance(target, (QAbstractSpinBox, QLineEdit)):
+            target.installEventFilter(self)
+
+        for widget in target.findChildren(QAbstractSpinBox):
+            widget.installEventFilter(self)
+        for widget in target.findChildren(QLineEdit):
+            widget.installEventFilter(self)
 
 
 _UI_CACHE = {

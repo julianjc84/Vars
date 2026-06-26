@@ -8,3 +8,5 @@ FreeCAD Vars: Commands.
 """
 
 from .editor import EditVars
+from .preferences import OpenPreferences
+
